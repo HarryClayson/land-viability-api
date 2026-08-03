@@ -1,0 +1,14 @@
+# Python libraries the land-viability API needs. Render installs these automatically
+# (build command: pip install -r requirements.txt).
+flask
+flask-cors
+gunicorn
+requests
+numpy
+shapely
+pyproj
+geopandas
+rasterio
+owslib
+osdatahub
+aiohttp

@@ -1,0 +1,19 @@
+# Render "Blueprint" -- tells Render how to build and run the land-viability API automatically,
+# so you don't have to type the build/start commands by hand. (You can also do it manually; the
+# DEPLOY_RENDER guide covers both.)
+services:
+  - type: web
+    name: land-viability-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # gunicorn is the production web server. --timeout 120 gives the LiDAR download + geometry maths
+    # time to finish (the default 30s would cut a real analysis off). It binds to the port Render assigns.
+    startCommand: gunicorn land_viability_api:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1 --threads 2
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.6"
+      - key: OS_API_KEY      # paste your OS Data Hub key in the Render dashboard (sync:false = you set it there, not in the file)
+        sync: false
+      - key: W3W_API_KEY     # paste your what3words key (only needed for what3words searches)
+        sync: false
