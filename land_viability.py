@@ -55,10 +55,13 @@ import requests
 
 # Heavy geospatial deps -- import with a clear message if missing.
 try:
+    import gc
     import numpy as np
     import geopandas as gpd
     import rasterio
     from rasterio.features import shapes as raster_shapes
+    from rasterio.enums import Resampling
+    from affine import Affine
     from shapely.geometry import shape, mapping, Point, box
     from shapely.ops import unary_union
     from shapely.geometry import Polygon, MultiPolygon
@@ -81,6 +84,7 @@ EA_DTM_WCS = "https://environment.data.gov.uk/spatialdata/lidar-composite-digita
 EA_DSM_WCS = "https://environment.data.gov.uk/spatialdata/lidar-composite-digital-surface-model-first-return-dsm-1m/wcs"
 
 CANOPY_MIN_HEIGHT_M = 1.0        # >= this many metres tall (and not a building) = trees/bushes. 1m keeps bushes; raise to ~2.5 for trees only.
+LIDAR_RESOLUTION_M = 2.0         # process LiDAR at this cell size (m). 2m ~= 1/4 the memory of native 1m; raise to 5 for big areas / tight RAM.
 MIN_FEATURE_AREA_M2 = 9.0        # drop slivers/noise smaller than this (m^2)
 DEFAULT_RADIUS_M = 500
 AOI_SHAPE = "circle"             # "circle" or "square"
@@ -162,9 +166,11 @@ def get_buildings(aoi_bng):
 # VEGETATION (EA LiDAR canopy height = First-Return DSM - DTM)
 # ============================================================================
 def _wcs_geotiff(wcs_url, aoi_bng):
-    """GetCoverage a 1 m GeoTIFF over the AOI bbox from an EA LiDAR WCS. Returns (array, transform,
-    nodata). Tries WCS 1.0.0 (simple bbox model) then 2.0.1. Raises on total failure."""
+    """GetCoverage a GeoTIFF over the AOI bbox from an EA LiDAR WCS and read it at LIDAR_RESOLUTION_M
+    (coarser than native 1 m) to keep memory low. Returns (array, transform, nodata). Tries WCS 1.0.0
+    (simple bbox model) then 2.0.1. Raises on total failure."""
     minx, miny, maxx, maxy = [int(round(v)) for v in aoi_bng.bounds]
+    res = LIDAR_RESOLUTION_M
     last_err = None
     for version in ("1.0.0", "2.0.1"):
         try:
@@ -172,18 +178,36 @@ def _wcs_geotiff(wcs_url, aoi_bng):
             cov_id = list(wcs.contents)[0]
             fmt = _pick_geotiff_format(wcs.contents[cov_id])
             if version == "1.0.0":
+                # Ask the server for the coarse resolution too, so the download itself is smaller.
                 resp = wcs.getCoverage(identifier=cov_id, bbox=(minx, miny, maxx, maxy),
-                                       crs=BNG, format=fmt, resx=1, resy=1)
+                                       crs=BNG, format=fmt, resx=res, resy=res)
             else:
                 resp = wcs.getCoverage(identifier=[cov_id], format=fmt,
                                        subsets=[("E", minx, maxx), ("N", miny, maxy)], crs=BNG)
             data = resp.read()
-            with rasterio.io.MemoryFile(data) as mf, mf.open() as ds:
-                return ds.read(1).astype("float32"), ds.transform, ds.nodata
+            arr, tf, nd = _read_decimated(data, res)
+            del data
+            gc.collect()
+            return arr, tf, nd
         except Exception as ex:
             last_err = ex
             continue
     raise RuntimeError(f"WCS fetch failed for {wcs_url}: {last_err}")
+
+
+def _read_decimated(geotiff_bytes, target_res_m):
+    """Read a GeoTIFF (as bytes) at ~target_res_m cell size, decimating DURING read so we never hold
+    the full-resolution array in memory. Returns (float32 array, transform, nodata). This bounds peak
+    memory regardless of what resolution the WCS actually returned."""
+    with rasterio.io.MemoryFile(geotiff_bytes) as mf, mf.open() as ds:
+        native = abs(ds.transform.a) or 1.0
+        factor = max(1, int(round(target_res_m / native)))
+        out_h = max(1, ds.height // factor)
+        out_w = max(1, ds.width // factor)
+        arr = ds.read(1, out_shape=(out_h, out_w), resampling=Resampling.bilinear).astype("float32")
+        # Transform for the decimated grid = native transform scaled by the real decimation ratio.
+        transform = ds.transform * Affine.scale(ds.width / out_w, ds.height / out_h)
+        return arr, transform, ds.nodata
 
 
 def _pick_geotiff_format(coverage):
@@ -207,11 +231,15 @@ def fetch_ea_vegetation(aoi_bng, canopy_min=CANOPY_MIN_HEIGHT_M):
         if nd is not None:
             valid &= arr != nd
         valid &= np.isfinite(arr)
-    canopy = np.where(valid, dsm - dtm, -9999.0)
-    veg_mask = (canopy >= canopy_min) & valid
+    # veg where (DSM-DTM) >= canopy_min and both pixels valid. Compute in place, then free the rasters.
+    veg_mask = valid & ((dsm - dtm) >= canopy_min)
+    del dsm, dtm, valid
+    gc.collect()
     if not veg_mask.any():
         return gpd.GeoDataFrame(geometry=[], crs=BNG)
     geoms = [shape(g) for g, v in raster_shapes(veg_mask.astype("uint8"), mask=veg_mask, transform=dsm_tf) if v == 1]
+    del veg_mask
+    gc.collect()
     if not geoms:
         return gpd.GeoDataFrame(geometry=[], crs=BNG)
     return gpd.GeoDataFrame(geometry=geoms, crs=BNG)

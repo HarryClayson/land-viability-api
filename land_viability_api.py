@@ -69,8 +69,10 @@ def analyze():
         return jsonify({"error": "missing 'query' (address, 'lat,lon', or what3words)"}), 400
     if shape not in ("circle", "square"):
         return jsonify({"error": "shape must be 'circle' or 'square'"}), 400
-    # Guard-rail: cap the radius so a user can't request an enormous, slow/expensive area.
-    radius = max(50.0, min(radius, 2000.0))
+    # Guard-rail: cap the radius so a user can't request an enormous area that blows the RAM limit.
+    # 1000 m is comfortable on a 512 MB (free) Render instance at LIDAR_RESOLUTION_M=2; raise it once
+    # you're on a bigger instance.
+    radius = max(50.0, min(radius, 1000.0))
 
     try:
         result = analyze_query(query, radius_m=radius, shape_kind=shape, canopy_min=canopy)

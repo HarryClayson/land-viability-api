@@ -9,7 +9,9 @@ services:
     buildCommand: pip install -r requirements.txt
     # gunicorn is the production web server. --timeout 120 gives the LiDAR download + geometry maths
     # time to finish (the default 30s would cut a real analysis off). It binds to the port Render assigns.
-    startCommand: gunicorn land_viability_api:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1 --threads 2
+    # 1 worker + 1 thread = only one heavy analysis runs at a time (never doubles the memory).
+    # --max-requests recycles the worker after a few jobs so any memory build-up is released.
+    startCommand: gunicorn land_viability_api:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1 --threads 1 --max-requests 25 --max-requests-jitter 5
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.6"
