@@ -259,9 +259,11 @@ def _clean(gdf, aoi_bng):
 
 
 def analyze_area(lat, lon, radius_m=DEFAULT_RADIUS_M, shape_kind=AOI_SHAPE, out_dir=None,
-                 canopy_min=CANOPY_MIN_HEIGHT_M):
+                 canopy_min=CANOPY_MIN_HEIGHT_M, parcels_path=None):
     """Classify land in the AOI into buildings / vegetation / candidate. Returns a dict of EPSG:4326
-    GeoDataFrames + area stats, and (if out_dir given) writes buildings/vegetation/candidate GeoJSON."""
+    GeoDataFrames + area stats, and (if out_dir given) writes buildings/vegetation/candidate GeoJSON.
+    If parcels_path is given (a council INSPIRE Index Polygons file), also returns a 'land_plots' layer
+    outlining every registered land parcel in the AOI -- the plot outlines for the app's area search."""
     print(f"Analysing {radius_m} m {shape_kind} around ({lat}, {lon}) ...")
     aoi = build_aoi_bng(lat, lon, radius_m, shape_kind)
     aoi_area = aoi.area
@@ -304,15 +306,31 @@ def analyze_area(lat, lon, radius_m=DEFAULT_RADIUS_M, shape_kind=AOI_SHAPE, out_
            "candidate": candidate.to_crs(WGS84), "aoi": gpd.GeoDataFrame(geometry=[aoi], crs=BNG).to_crs(WGS84),
            "stats": stats}
 
+    # Optional: outline every registered land parcel in the AOI (HM Land Registry INSPIRE), so an
+    # area search can show plot boundaries alongside the built/vegetation/candidate layers.
+    written_layers = ["buildings", "vegetation", "candidate", "aoi"]
+    if parcels_path:
+        try:
+            import plot_outline as po
+            plots = po.parcels_in_area(aoi, parcels_path, aoi_crs=BNG)
+            out["land_plots"] = plots.to_crs(WGS84) if not plots.empty else gpd.GeoDataFrame(geometry=[], crs=WGS84)
+            stats["land_plots_count"] = int(len(plots))
+            stats["land_plots_source"] = "HM Land Registry INSPIRE Index Polygons (registered freehold parcels)"
+            written_layers.append("land_plots")
+            print(f"  land plots: {len(plots)} INSPIRE parcel(s) in the AOI")
+        except Exception as ex:
+            print(f"  land plots: UNAVAILABLE ({ex}).")
+            out["land_plots"] = gpd.GeoDataFrame(geometry=[], crs=WGS84)
+
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-        for name in ("buildings", "vegetation", "candidate", "aoi"):
+        for name in written_layers:
             path = os.path.join(out_dir, f"{name}.geojson")
             g = out[name]
             (g if not g.empty else gpd.GeoDataFrame(geometry=[], crs=WGS84)).to_file(path, driver="GeoJSON")
         with open(os.path.join(out_dir, "stats.json"), "w") as f:
             json.dump(stats, f, indent=2)
-        print(f"  wrote buildings/vegetation/candidate/aoi .geojson + stats.json to {out_dir}/")
+        print(f"  wrote {'/'.join(written_layers)} .geojson + stats.json to {out_dir}/")
 
     print(f"  RESULT: built {stats['built_pct']}%  vegetation {stats['vegetation_pct']}%  "
           f"candidate {stats['candidate_pct']}%")
@@ -405,16 +423,21 @@ def resolve_location(query, os_key=None, w3w_key=None):
 
 
 def analyze_query(query, radius_m=DEFAULT_RADIUS_M, shape_kind=AOI_SHAPE, canopy_min=CANOPY_MIN_HEIGHT_M,
-                  os_key=None, w3w_key=None, out_dir=None):
+                  os_key=None, w3w_key=None, out_dir=None, parcels_path=None):
     """Platform entry point: resolve a search string (address/coords/what3words) then classify the
     area. Returns a JSON-serialisable dict: {query, resolved:{lat,lon}, radius_m, stats, geojson}
     where geojson is a single FeatureCollection with each feature tagged properties.class in
-    {building, vegetation, candidate, aoi} -- ready to style on your web map."""
+    {building, vegetation, candidate, aoi, land_plot} -- ready to style on your web map. Pass
+    parcels_path (a council INSPIRE file) to include the land_plot outlines in the area search."""
     lat, lon = resolve_location(query, os_key, w3w_key)
-    out = analyze_area(lat, lon, radius_m, shape_kind, out_dir=out_dir, canopy_min=canopy_min)
+    out = analyze_area(lat, lon, radius_m, shape_kind, out_dir=out_dir, canopy_min=canopy_min,
+                       parcels_path=parcels_path)
     feats = []
-    for cls, key in (("building", "buildings"), ("vegetation", "vegetation"),
-                     ("candidate", "candidate"), ("aoi", "aoi")):
+    layers = [("building", "buildings"), ("vegetation", "vegetation"),
+              ("candidate", "candidate"), ("aoi", "aoi")]
+    if "land_plots" in out:
+        layers.append(("land_plot", "land_plots"))
+    for cls, key in layers:
         for geom in out[key].geometry:
             if geom is not None and not geom.is_empty:
                 feats.append({"type": "Feature", "properties": {"class": cls}, "geometry": mapping(geom)})
@@ -431,12 +454,13 @@ def main():
     ap.add_argument("--shape", choices=["circle", "square"], default=AOI_SHAPE)
     ap.add_argument("--canopy", type=float, default=CANOPY_MIN_HEIGHT_M, help="min vegetation height (m)")
     ap.add_argument("--out", default="./land_viability_out", help="output folder for GeoJSON")
+    ap.add_argument("--parcels", help="council INSPIRE Index Polygons file -> also outline land plots in the area")
     a = ap.parse_args()
     if a.query:
-        res = analyze_query(a.query, a.radius, a.shape, a.canopy, out_dir=a.out)
+        res = analyze_query(a.query, a.radius, a.shape, a.canopy, out_dir=a.out, parcels_path=a.parcels)
         print(f"  resolved {a.query!r} -> {res['resolved']}")
     elif a.lat is not None and a.lon is not None:
-        analyze_area(a.lat, a.lon, a.radius, a.shape, a.out, a.canopy)
+        analyze_area(a.lat, a.lon, a.radius, a.shape, a.out, a.canopy, parcels_path=a.parcels)
     else:
         ap.error("provide either --query, or both --lat and --lon")
 
