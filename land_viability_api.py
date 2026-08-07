@@ -52,15 +52,52 @@ from land_viability import analyze_query, DEFAULT_RADIUS_M, AOI_SHAPE, CANOPY_MI
 # A .gpkg/.fgb is read by BOUNDING BOX per request (fast, low memory); querying raw .gml scans the
 # whole file each time and will be slow. Then: export PARCELS_FILE=/path/to/kent_parcels.gpkg
 PARCELS_FILE = os.environ.get("PARCELS_FILE", "")
-# Startup diagnostic: setting PARCELS_FILE is not enough -- the FILE itself must exist on the server.
-# This prints to the Render logs the moment the service boots, so you can see at a glance whether the
-# land-plot layer will work (and /health reports the same).
+# OPTION 2 (host-externally): if the parcels file is too big to commit, host it somewhere public (e.g.
+# a GitHub Release asset, or Cloudflare R2 / Backblaze B2) and set PARCELS_URL to its download link.
+# On boot, if PARCELS_FILE isn't already present, it's downloaded once from PARCELS_URL to PARCELS_FILE.
+# Use a writable path for PARCELS_FILE on Render, e.g. /tmp/kent_parcels.gpkg. NOTE: the container disk
+# is ephemeral, so it re-downloads on each deploy / cold start -- fine, just adds a little startup time.
+PARCELS_URL = os.environ.get("PARCELS_URL", "")
+
+
+def _ensure_parcels_file():
+    """Download PARCELS_FILE from PARCELS_URL once at startup if it isn't already on disk. Streams to a
+    temporary '.part' file and renames on success, so an interrupted download never leaves a corrupt
+    file behind. Any failure just leaves plots disabled (never crashes the service)."""
+    if not PARCELS_FILE or os.path.exists(PARCELS_FILE) or not PARCELS_URL:
+        return
+    import shutil
+    import urllib.request
+    d = os.path.dirname(os.path.abspath(PARCELS_FILE))
+    os.makedirs(d, exist_ok=True)
+    tmp = PARCELS_FILE + ".part"
+    print(f"[land-plots] PARCELS_FILE missing; downloading from PARCELS_URL -> {PARCELS_FILE} ...")
+    try:
+        req = urllib.request.Request(PARCELS_URL, headers={"User-Agent": "land-viability-api"})
+        with urllib.request.urlopen(req, timeout=900) as r, open(tmp, "wb") as f:
+            shutil.copyfileobj(r, f, length=1024 * 1024)
+        os.replace(tmp, PARCELS_FILE)
+        print(f"[land-plots] downloaded {os.path.getsize(PARCELS_FILE) / 1e6:.0f} MB.")
+    except Exception as e:
+        print(f"[land-plots] download FAILED ({e}); land-plot outlines will be disabled.")
+        try:
+            os.path.exists(tmp) and os.remove(tmp)
+        except OSError:
+            pass
+
+
+_ensure_parcels_file()
+
+# Startup diagnostic: setting PARCELS_FILE is not enough -- the FILE itself must exist on the server
+# (either committed/mounted, or downloaded via PARCELS_URL above). This prints to the Render logs the
+# moment the service boots, so you can see at a glance whether the land-plot layer will work.
 PARCELS_OK = bool(PARCELS_FILE) and os.path.exists(PARCELS_FILE)
 if not PARCELS_FILE:
     print("[land-plots] PARCELS_FILE not set -> land-plot outlines DISABLED.")
 elif not PARCELS_OK:
     print(f"[land-plots] PARCELS_FILE is set to {PARCELS_FILE!r} but NO FILE exists there -> land-plot "
-          "outlines DISABLED. Deploy the .gpkg to the server at that path (an env var alone is not enough).")
+          "outlines DISABLED. Deploy the .gpkg there, or set PARCELS_URL so it downloads on boot "
+          "(an env var alone is not enough).")
 else:
     print(f"[land-plots] using parcels file: {PARCELS_FILE}")
 
