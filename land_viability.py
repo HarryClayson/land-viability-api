@@ -478,7 +478,9 @@ def analyze_query(query, radius_m=DEFAULT_RADIUS_M, shape_kind=AOI_SHAPE, canopy
                      "owner_class": row.get("owner_class", "Other"),
                      # Always emitted: its presence confirms THIS (current) analyze_query is deployed;
                      # its content shows how the plot was classified (or why it wasn't).
-                     "class_source": row.get("class_source", "n/a (classifier added no column)")}
+                     "class_source": row.get("class_source", "n/a (classifier added no column)"),
+                     # composition of the plot by OSM land-use, e.g. "Farmland 66%; unmapped 26%".
+                     "land_type_breakdown": row.get("land_type_breakdown", "")}
             if "inspire_id" in lp.columns:
                 props["inspire_id"] = row.get("inspire_id", "")
             feats.append({"type": "Feature", "properties": props, "geometry": mapping(geom)})

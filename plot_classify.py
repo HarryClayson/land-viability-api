@@ -188,15 +188,18 @@ def fetch_osm_landuse(aoi_bng, aoi_crs=BNG, timeout=60):
 # Per-plot classification
 # ============================================================================
 def classify_land_type(plot_geom, osm_gdf):
-    """(land_type, source) for one plot, by area-weighted overlap with OSM land-use features."""
+    """(land_type, source, breakdown) for one plot, by area-weighted overlap with OSM land-use.
+    `breakdown` is a composition string, e.g. 'Farmland 66%; Woodland 8%; unmapped 26%'. The 'unmapped'
+    share is plot area with NO OSM land-use polygon over it -- roads, gardens, tracks, or simply ground
+    OSM hasn't tagged; OSM land-use is not a gap-free map, so this remainder is normal."""
     if osm_gdf is None or len(osm_gdf) == 0:
-        return "Unknown", "no OSM data"
+        return "Unknown", "no OSM data", "unmapped 100%"
     try:
         cand = list(osm_gdf.sindex.query(plot_geom, predicate="intersects"))
     except Exception:
         cand = list(range(len(osm_gdf)))
     if not cand:
-        return "Unknown", "no OSM overlap"
+        return "Unknown", "no OSM overlap", "unmapped 100%"
     area = plot_geom.area or 1.0
     frac = defaultdict(float)
     for i in cand:
@@ -210,13 +213,19 @@ def classify_land_type(plot_geom, osm_gdf):
         if not inter.is_empty:
             frac[lt] += inter.area / area
     if not frac:
-        return "Unknown", "OSM features had no mapped land-use"
+        return "Unknown", "OSM features had no mapped land-use", "unmapped 100%"
+    # Composition string (largest share first) + the unmapped remainder.
+    parts = [f"{t} {round(f * 100)}%" for t, f in sorted(frac.items(), key=lambda x: -x[1])]
+    unmapped = max(0.0, 1.0 - sum(frac.values()))     # can be 0 if OSM polygons overlap and over-cover
+    if unmapped >= 0.005:
+        parts.append(f"unmapped {round(unmapped * 100)}%")
+    breakdown = "; ".join(parts)
     major = sorted([lt for lt, f in frac.items() if f >= HYBRID_MIN_FRACTION],
                    key=lambda lt: LAND_TYPES.index(lt) if lt in LAND_TYPES else 99)
     if len(major) >= 2:
-        return "Hybrid", "OSM: " + " + ".join(major)
+        return "Hybrid", "OSM: " + " + ".join(major), breakdown
     best = max(frac, key=frac.get)
-    return best, f"OSM {best} ({round(frac[best] * 100)}% of plot)"
+    return best, f"OSM {best} ({round(frac[best] * 100)}% of plot)", breakdown
 
 
 def _gov_from_osm(plot_geom, osm_gdf):
@@ -250,6 +259,7 @@ def classify_plots(plots_gdf, aoi_bng, aoi_crs=BNG, ccod=None, reverse_geocode_b
     types = ["Unknown"] * n
     owners = ["Other"] * n
     sources = ["classification did not complete"] * n
+    breakdowns = ["unmapped 100%"] * n
     try:
         from pyproj import Transformer
         osm = None
@@ -263,8 +273,9 @@ def classify_plots(plots_gdf, aoi_bng, aoi_crs=BNG, ccod=None, reverse_geocode_b
         pending_idx, pending_lonlat = [], []       # plots needing a CCOD postcode lookup
         for i, geom in enumerate(out.geometry):
             try:
-                lt, lts = classify_land_type(geom, osm)
+                lt, lts, lb = classify_land_type(geom, osm)
                 types[i] = lt
+                breakdowns[i] = lb
                 if _gov_from_osm(geom, osm):
                     owners[i] = "Government"
                     sources[i] = f"type: {lts}; owner: OSM public/institutional use"
@@ -300,6 +311,7 @@ def classify_plots(plots_gdf, aoi_bng, aoi_crs=BNG, ccod=None, reverse_geocode_b
     out["land_type"] = types
     out["owner_class"] = owners
     out["class_source"] = sources
+    out["land_type_breakdown"] = breakdowns
     return out
 
 

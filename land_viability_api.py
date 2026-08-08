@@ -125,7 +125,7 @@ _download_if_missing(os.environ.get("CCOD_URL", ""), CCOD_FILE, "classify-ccod")
 _download_if_missing(os.environ.get("OCOD_URL", ""), OCOD_FILE, "classify-ocod")
 # Bump this whenever the classifier code changes, so /health tells you at a glance whether the code
 # actually running on the server is the latest you pushed (rules out "did the deploy pick it up?").
-API_VERSION = "classify-2026-08-08f"
+API_VERSION = "classify-2026-08-08g"
 
 # Kill switch: set CLASSIFY_PLOTS=0 to turn OFF all plot classification (types + ownership) if you ever
 # need the area search to be as light as possible.
