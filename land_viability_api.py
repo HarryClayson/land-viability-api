@@ -123,17 +123,23 @@ OCOD_FILE = os.environ.get("OCOD_FILE", "")
 # Optional: host the (large) CCOD/OCOD CSVs and set these to download them on boot (like PARCELS_URL).
 _download_if_missing(os.environ.get("CCOD_URL", ""), CCOD_FILE, "classify-ccod")
 _download_if_missing(os.environ.get("OCOD_URL", ""), OCOD_FILE, "classify-ocod")
+# Kill switch: set CLASSIFY_PLOTS=0 to turn OFF all plot classification (types + ownership) if you ever
+# need the area search to be as light as possible.
+import land_viability as _lv
+if os.environ.get("CLASSIFY_PLOTS", "1").lower() in ("0", "false", "no"):
+    _lv.CLASSIFY_PLOTS = False
+    print("[classify] DISABLED via CLASSIFY_PLOTS=0.")
+
 _CCOD = None
-_REVERSE_GEOCODE = None
+_REVERSE_GEOCODE_BULK = None
 if CCOD_FILE and os.path.exists(CCOD_FILE):
     try:
         import plot_classify as _pc
         _CCOD = _pc.CCOD().load(CCOD_FILE, OCOD_FILE)
-        # Reverse-geocode plot -> postcode. Prefer OS Places if you have the key; otherwise the FREE
-        # postcodes.io service (no key needed), so the Corporate tier works with just the CCOD file.
-        _REVERSE_GEOCODE = _pc.os_places_reverse_geocode(OS_API_KEY) or _pc.postcodesio_reverse_geocode()
-        print(f"[classify] Corporate-ownership tier ON (CCOD loaded; reverse-geocode="
-              f"{'OS Places' if OS_API_KEY else 'postcodes.io (free)'}).")
+        # Reverse-geocode plots -> postcodes in BULK (postcodes.io, free, ~100 per request) so a big
+        # search does a couple of calls, not one per plot. This is what prevents the worker timeout.
+        _REVERSE_GEOCODE_BULK = _pc.postcodesio_bulk_reverse_geocode()
+        print("[classify] Corporate-ownership tier ON (CCOD loaded; bulk reverse-geocode via postcodes.io).")
     except Exception as e:
         print(f"[classify] CCOD load failed ({e}); owner_class = Government/Other only.")
 else:
@@ -202,12 +208,22 @@ def analyze():
     try:
         result = analyze_query(query, radius_m=radius, shape_kind=shape, canopy_min=canopy,
                                parcels_path=parcels_path, os_key=OS_API_KEY,
-                               ccod=_CCOD, reverse_geocode=_REVERSE_GEOCODE)
+                               ccod=_CCOD, reverse_geocode_bulk=_REVERSE_GEOCODE_BULK)
         return jsonify(result)
     except ValueError as e:            # couldn't geocode the query
         return jsonify({"error": str(e)}), 422
     except Exception as e:             # upstream data source failed etc.
         return jsonify({"error": f"analysis failed: {e}"}), 502
+
+
+@app.errorhandler(Exception)
+def _json_errors(e):
+    # Last-resort: return JSON (not a bare HTML 'Internal Server Error') for anything that slips through,
+    # so the client always gets a readable message. (A worker that is KILLED for timeout/OOM can't be
+    # caught here -- that shows in the Render logs -- but in-process errors will.)
+    from werkzeug.exceptions import HTTPException
+    code = e.code if isinstance(e, HTTPException) else 500
+    return jsonify({"error": f"{type(e).__name__}: {e}"}), code
 
 
 if __name__ == "__main__":

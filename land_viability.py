@@ -84,7 +84,12 @@ EA_DTM_WCS = "https://environment.data.gov.uk/spatialdata/lidar-composite-digita
 EA_DSM_WCS = "https://environment.data.gov.uk/spatialdata/lidar-composite-digital-surface-model-first-return-dsm-1m/wcs"
 
 CANOPY_MIN_HEIGHT_M = 1.0        # >= this many metres tall (and not a building) = trees/bushes. 1m keeps bushes; raise to ~2.5 for trees only.
-LIDAR_RESOLUTION_M = 2.0         # process LiDAR at this cell size (m). 2m ~= 1/4 the memory of native 1m; raise to 5 for big areas / tight RAM.
+# LiDAR cell size (m): the single biggest memory lever. 2m ~= 1/4 the memory of native 1m; 5m ~= 1/25.
+# Override with the LIDAR_RESOLUTION_M env var (e.g. set it to 5 on a tight 512 MB free instance).
+LIDAR_RESOLUTION_M = float(os.environ.get("LIDAR_RESOLUTION_M", "2.0"))
+# Set INCLUDE_VEGETATION=0 to skip the LiDAR fetch entirely (removes the biggest per-request memory
+# use). Candidate land then = the area minus buildings only (vegetation is reported as 0 / disabled).
+INCLUDE_VEGETATION = os.environ.get("INCLUDE_VEGETATION", "1").lower() not in ("0", "false", "no")
 MIN_FEATURE_AREA_M2 = 9.0        # drop slivers/noise smaller than this (m^2)
 DEFAULT_RADIUS_M = 500
 AOI_SHAPE = "circle"             # "circle" or "square"
@@ -220,7 +225,11 @@ def _pick_geotiff_format(coverage):
 
 def fetch_ea_vegetation(aoi_bng, canopy_min=CANOPY_MIN_HEIGHT_M):
     """Vegetation polygons (EPSG:27700) from EA LiDAR canopy height (First-Return DSM - DTM) >=
-    canopy_min. Returns a GeoDataFrame; raises if the LiDAR services can't be reached."""
+    canopy_min. Returns a GeoDataFrame; raises if the LiDAR services can't be reached. Returns empty
+    immediately (fetching no raster) when INCLUDE_VEGETATION=0 -- the biggest per-request memory saver."""
+    import geopandas as gpd
+    if not INCLUDE_VEGETATION:
+        return gpd.GeoDataFrame(geometry=[], crs=BNG)
     dsm, dsm_tf, dsm_nd = _wcs_geotiff(EA_DSM_WCS, aoi_bng)
     dtm, dtm_tf, dtm_nd = _wcs_geotiff(EA_DTM_WCS, aoi_bng)
     rows = min(dsm.shape[0], dtm.shape[0])
@@ -263,7 +272,7 @@ CLASSIFY_PLOTS = True   # tag each land plot with a land_type + owner_class (via
 
 def analyze_area(lat, lon, radius_m=DEFAULT_RADIUS_M, shape_kind=AOI_SHAPE, out_dir=None,
                  canopy_min=CANOPY_MIN_HEIGHT_M, parcels_path=None,
-                 classify=None, ccod=None, reverse_geocode=None):
+                 classify=None, ccod=None, reverse_geocode_bulk=None):
     """Classify land in the AOI into buildings / vegetation / candidate. Returns a dict of EPSG:4326
     GeoDataFrames + area stats, and (if out_dir given) writes buildings/vegetation/candidate GeoJSON.
     If parcels_path is given (a council INSPIRE Index Polygons file), also returns a 'land_plots' layer
@@ -277,7 +286,7 @@ def analyze_area(lat, lon, radius_m=DEFAULT_RADIUS_M, shape_kind=AOI_SHAPE, out_
     buildings, b_src = get_buildings(aoi)
     buildings = _clean(buildings, aoi)
 
-    veg_src = "EA LIDAR (DSM-DTM canopy)"
+    veg_src = "EA LIDAR (DSM-DTM canopy)" if INCLUDE_VEGETATION else "disabled (INCLUDE_VEGETATION=0)"
     try:
         vegetation = fetch_ea_vegetation(aoi, canopy_min)
         vegetation = _clean(vegetation, aoi)
@@ -323,7 +332,8 @@ def analyze_area(lat, lon, radius_m=DEFAULT_RADIUS_M, shape_kind=AOI_SHAPE, out_
             if do_classify and not plots.empty:
                 try:
                     import plot_classify as pc
-                    plots = pc.classify_plots(plots, aoi, aoi_crs=BNG, ccod=ccod, reverse_geocode=reverse_geocode)
+                    plots = pc.classify_plots(plots, aoi, aoi_crs=BNG, ccod=ccod,
+                                              reverse_geocode_bulk=reverse_geocode_bulk)
                 except Exception as cex:
                     print(f"  plot classification skipped ({cex}).")
             out["land_plots"] = plots.to_crs(WGS84) if not plots.empty else gpd.GeoDataFrame(geometry=[], crs=WGS84)
@@ -437,7 +447,7 @@ def resolve_location(query, os_key=None, w3w_key=None):
 
 def analyze_query(query, radius_m=DEFAULT_RADIUS_M, shape_kind=AOI_SHAPE, canopy_min=CANOPY_MIN_HEIGHT_M,
                   os_key=None, w3w_key=None, out_dir=None, parcels_path=None,
-                  ccod=None, reverse_geocode=None):
+                  ccod=None, reverse_geocode_bulk=None):
     """Platform entry point: resolve a search string (address/coords/what3words) then classify the
     area. Returns a JSON-serialisable dict: {query, resolved:{lat,lon}, radius_m, stats, geojson}
     where geojson is a single FeatureCollection with each feature tagged properties.class in
@@ -447,7 +457,7 @@ def analyze_query(query, radius_m=DEFAULT_RADIUS_M, shape_kind=AOI_SHAPE, canopy
     the Corporate-ownership tier."""
     lat, lon = resolve_location(query, os_key, w3w_key)
     out = analyze_area(lat, lon, radius_m, shape_kind, out_dir=out_dir, canopy_min=canopy_min,
-                       parcels_path=parcels_path, ccod=ccod, reverse_geocode=reverse_geocode)
+                       parcels_path=parcels_path, ccod=ccod, reverse_geocode_bulk=reverse_geocode_bulk)
     feats = []
     for cls, key in (("building", "buildings"), ("vegetation", "vegetation"),
                      ("candidate", "candidate"), ("aoi", "aoi")):
