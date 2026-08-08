@@ -243,46 +243,59 @@ def classify_plots(plots_gdf, aoi_bng, aoi_crs=BNG, ccod=None, reverse_geocode_b
     aren't already Government-by-OSM are reverse-geocoded to a postcode in a SINGLE batched call (per
     ~100 plots) rather than one HTTP request each -- this is what keeps a big search from timing out.
     Never raises: on any failure plots come back land_type='Unknown', owner_class='Other'."""
-    from pyproj import Transformer
     out = plots_gdf.copy()
-    osm = None
+    n = len(out)
+    # Pre-fill defaults so the three columns are ALWAYS present, even if something below fails -- that
+    # guarantees class_source appears in the response and each plot's source string explains itself.
+    types = ["Unknown"] * n
+    owners = ["Other"] * n
+    sources = ["classification did not complete"] * n
     try:
-        osm = fetch_osm_landuse(aoi_bng, aoi_crs)
-        print(f"  classify: {len(osm)} OSM land-use feature(s) in the AOI")
-    except Exception as e:
-        print(f"  classify: OSM land-use unavailable ({e}); land types will be 'Unknown'.")
-
-    to_wgs = Transformer.from_crs(BNG, WGS84, always_xy=True)
-    types, owners, sources = [], [], []
-    pending_idx, pending_lonlat = [], []          # plots needing a CCOD postcode lookup
-    for i, geom in enumerate(out.geometry):
-        lt, lts = classify_land_type(geom, osm)
-        types.append(lt)
-        if _gov_from_osm(geom, osm):
-            owners.append("Government")
-            sources.append(f"type: {lts}; owner: OSM public/institutional use")
-        else:
-            owners.append("Other")               # provisional; may be upgraded by the CCOD batch below
-            sources.append(f"type: {lts}; owner: no corporate/public match")
-            if ccod is not None and reverse_geocode_bulk is not None:
-                c = geom.centroid
-                lon, lat = to_wgs.transform(c.x, c.y)
-                pending_idx.append(i)
-                pending_lonlat.append((lon, lat))
-
-    # ONE batched reverse-geocode for every pending plot, then CCOD lookup.
-    if pending_idx:
+        from pyproj import Transformer
+        osm = None
         try:
-            postcodes = reverse_geocode_bulk(pending_lonlat)
+            osm = fetch_osm_landuse(aoi_bng, aoi_crs)
+            print(f"  classify: {len(osm)} OSM land-use feature(s) in the AOI")
         except Exception as e:
-            print(f"  classify: bulk reverse-geocode failed ({e}); ownership stays Government/Other.")
-            postcodes = [None] * len(pending_idx)
-        for k, i in enumerate(pending_idx):
-            pc = postcodes[k] if k < len(postcodes) else None
-            cls = ccod.classify_postcode(pc) if pc else None
-            if cls:
-                owners[i] = cls
-                sources[i] = sources[i].rsplit("owner:", 1)[0] + f"owner: CCOD {pc} -> {cls}"
+            print(f"  classify: OSM land-use unavailable ({e}); land types will be 'Unknown'.")
+
+        to_wgs = Transformer.from_crs(BNG, WGS84, always_xy=True)
+        pending_idx, pending_lonlat = [], []       # plots needing a CCOD postcode lookup
+        for i, geom in enumerate(out.geometry):
+            try:
+                lt, lts = classify_land_type(geom, osm)
+                types[i] = lt
+                if _gov_from_osm(geom, osm):
+                    owners[i] = "Government"
+                    sources[i] = f"type: {lts}; owner: OSM public/institutional use"
+                else:
+                    owners[i] = "Other"            # provisional; may be upgraded by the CCOD batch below
+                    sources[i] = f"type: {lts}; owner: no corporate/public match"
+                    if ccod is not None and reverse_geocode_bulk is not None:
+                        c = geom.centroid
+                        lon, lat = to_wgs.transform(c.x, c.y)
+                        pending_idx.append(i)
+                        pending_lonlat.append((lon, lat))
+            except Exception as pe:                # a bad single plot must not blank the whole search
+                sources[i] = f"per-plot classify error: {type(pe).__name__}: {pe}"
+
+        # ONE batched reverse-geocode for every pending plot, then CCOD lookup.
+        if pending_idx and ccod is not None and reverse_geocode_bulk is not None:
+            try:
+                postcodes = reverse_geocode_bulk(pending_lonlat)
+            except Exception as e:
+                print(f"  classify: bulk reverse-geocode failed ({e}); ownership stays Government/Other.")
+                postcodes = [None] * len(pending_idx)
+            for k, i in enumerate(pending_idx):
+                pc = postcodes[k] if k < len(postcodes) else None
+                cls = ccod.classify_postcode(pc) if pc else None
+                if cls:
+                    owners[i] = cls
+                    sources[i] = sources[i].rsplit("owner:", 1)[0] + f"owner: CCOD {pc} -> {cls}"
+    except Exception as e:
+        import traceback
+        print(f"  classify: FAILED ({type(e).__name__}: {e})")
+        traceback.print_exc()
 
     out["land_type"] = types
     out["owner_class"] = owners

@@ -335,7 +335,9 @@ def analyze_area(lat, lon, radius_m=DEFAULT_RADIUS_M, shape_kind=AOI_SHAPE, out_
                     plots = pc.classify_plots(plots, aoi, aoi_crs=BNG, ccod=ccod,
                                               reverse_geocode_bulk=reverse_geocode_bulk)
                 except Exception as cex:
-                    print(f"  plot classification skipped ({cex}).")
+                    import traceback
+                    print(f"  plot classification skipped ({type(cex).__name__}: {cex}).")
+                    traceback.print_exc()
             out["land_plots"] = plots.to_crs(WGS84) if not plots.empty else gpd.GeoDataFrame(geometry=[], crs=WGS84)
             stats["land_plots_count"] = int(len(plots))
             stats["land_plots_source"] = "HM Land Registry INSPIRE Index Polygons (registered freehold parcels)"
@@ -472,10 +474,11 @@ def analyze_query(query, radius_m=DEFAULT_RADIUS_M, shape_kind=AOI_SHAPE, canopy
             if geom is None or geom.is_empty:
                 continue
             props = {"class": "land_plot",
-                     "land_type": row.get("land_type", "Unknown") if hasattr(row, "get") else "Unknown",
-                     "owner_class": row.get("owner_class", "Other") if hasattr(row, "get") else "Other"}
-            if "class_source" in lp.columns:
-                props["class_source"] = row.get("class_source", "")
+                     "land_type": row.get("land_type", "Unknown"),
+                     "owner_class": row.get("owner_class", "Other"),
+                     # Always emitted: its presence confirms THIS (current) analyze_query is deployed;
+                     # its content shows how the plot was classified (or why it wasn't).
+                     "class_source": row.get("class_source", "n/a (classifier added no column)")}
             if "inspire_id" in lp.columns:
                 props["inspire_id"] = row.get("inspire_id", "")
             feats.append({"type": "Feature", "properties": props, "geometry": mapping(geom)})
