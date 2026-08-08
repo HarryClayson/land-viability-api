@@ -123,12 +123,26 @@ OCOD_FILE = os.environ.get("OCOD_FILE", "")
 # Optional: host the (large) CCOD/OCOD CSVs and set these to download them on boot (like PARCELS_URL).
 _download_if_missing(os.environ.get("CCOD_URL", ""), CCOD_FILE, "classify-ccod")
 _download_if_missing(os.environ.get("OCOD_URL", ""), OCOD_FILE, "classify-ocod")
+# Bump this whenever the classifier code changes, so /health tells you at a glance whether the code
+# actually running on the server is the latest you pushed (rules out "did the deploy pick it up?").
+API_VERSION = "classify-2026-08-08e"
+
 # Kill switch: set CLASSIFY_PLOTS=0 to turn OFF all plot classification (types + ownership) if you ever
 # need the area search to be as light as possible.
 import land_viability as _lv
 if os.environ.get("CLASSIFY_PLOTS", "1").lower() in ("0", "false", "no"):
     _lv.CLASSIFY_PLOTS = False
     print("[classify] DISABLED via CLASSIFY_PLOTS=0.")
+
+# Can the server actually import the classifier module? (If False, classification silently no-ops.)
+try:
+    import plot_classify as _pc_probe  # noqa: F401
+    _CLASSIFY_IMPORTABLE = True
+except Exception as _pce:
+    _CLASSIFY_IMPORTABLE = False
+    print(f"[classify] plot_classify NOT importable ({_pce}) -> classification will not run.")
+print(f"[startup] land-viability-api {API_VERSION} | classify_enabled={_lv.CLASSIFY_PLOTS} "
+      f"| plot_classify_importable={_CLASSIFY_IMPORTABLE}")
 
 _CCOD = None
 _REVERSE_GEOCODE_BULK = None
@@ -169,10 +183,13 @@ if CORS:
 def health():
     # Reports whether the land-plot layer is actually usable (file present), so you can check the
     # deploy from a browser: GET /health should show land_plots_enabled: true.
-    return jsonify({"ok": True, "land_plots_enabled": PARCELS_OK,
+    return jsonify({"ok": True, "version": API_VERSION,
+                    "land_plots_enabled": PARCELS_OK,
                     "parcels_file_set": bool(PARCELS_FILE),
                     "parcels_file_exists": PARCELS_OK,
-                    "land_type_classification": True,          # always on (free OSM)
+                    "classify_enabled": _lv.CLASSIFY_PLOTS,             # False if CLASSIFY_PLOTS=0
+                    "plot_classify_importable": _CLASSIFY_IMPORTABLE,  # False if the module didn't deploy
+                    "land_type_classification": _lv.CLASSIFY_PLOTS and _CLASSIFY_IMPORTABLE,
                     "corporate_ownership_tier": _CCOD is not None})
 
 
