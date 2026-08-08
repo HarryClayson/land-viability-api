@@ -88,6 +88,58 @@ def _ensure_parcels_file():
 
 _ensure_parcels_file()
 
+# ---- Plot classification (land_type + owner_class on each land plot) --------------------------------
+# land_type (OSM land-use) is ALWAYS on and free -- nothing to configure. The extra CORPORATE-ownership
+# tier is optional: set CCOD_FILE (and, ideally, OS_API_KEY for reverse-geocoding) to a downloaded HM
+# Land Registry CCOD file, and OCOD_FILE for the overseas-companies file. Without them, owner_class is
+# Government (from OSM) or Other.
+def _download_if_missing(url, path, label):
+    """Download `url` to `path` once if the file isn't already present (same pattern as the parcels
+    file). Streams to a .part then renames; any failure is non-fatal. No-op if url/path unset."""
+    if not path or not url or os.path.exists(path):
+        return
+    import shutil
+    import urllib.request
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + ".part"
+    print(f"[{label}] downloading {url} -> {path} ...")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "land-viability-api"})
+        with urllib.request.urlopen(req, timeout=1800) as r, open(tmp, "wb") as f:
+            shutil.copyfileobj(r, f, length=1024 * 1024)
+        os.replace(tmp, path)
+        print(f"[{label}] downloaded {os.path.getsize(path) / 1e6:.0f} MB.")
+    except Exception as e:
+        print(f"[{label}] download FAILED ({e}).")
+        try:
+            os.path.exists(tmp) and os.remove(tmp)
+        except OSError:
+            pass
+
+
+OS_API_KEY = os.environ.get("OS_API_KEY", "")
+CCOD_FILE = os.environ.get("CCOD_FILE", "")
+OCOD_FILE = os.environ.get("OCOD_FILE", "")
+# Optional: host the (large) CCOD/OCOD CSVs and set these to download them on boot (like PARCELS_URL).
+_download_if_missing(os.environ.get("CCOD_URL", ""), CCOD_FILE, "classify-ccod")
+_download_if_missing(os.environ.get("OCOD_URL", ""), OCOD_FILE, "classify-ocod")
+_CCOD = None
+_REVERSE_GEOCODE = None
+if CCOD_FILE and os.path.exists(CCOD_FILE):
+    try:
+        import plot_classify as _pc
+        _CCOD = _pc.CCOD().load(CCOD_FILE, OCOD_FILE)
+        # Reverse-geocode plot -> postcode. Prefer OS Places if you have the key; otherwise the FREE
+        # postcodes.io service (no key needed), so the Corporate tier works with just the CCOD file.
+        _REVERSE_GEOCODE = _pc.os_places_reverse_geocode(OS_API_KEY) or _pc.postcodesio_reverse_geocode()
+        print(f"[classify] Corporate-ownership tier ON (CCOD loaded; reverse-geocode="
+              f"{'OS Places' if OS_API_KEY else 'postcodes.io (free)'}).")
+    except Exception as e:
+        print(f"[classify] CCOD load failed ({e}); owner_class = Government/Other only.")
+else:
+    print("[classify] land_type ON (free OSM); owner_class = Government/Other "
+          "(set CCOD_FILE to add the Corporate tier).")
+
 # Startup diagnostic: setting PARCELS_FILE is not enough -- the FILE itself must exist on the server
 # (either committed/mounted, or downloaded via PARCELS_URL above). This prints to the Render logs the
 # moment the service boots, so you can see at a glance whether the land-plot layer will work.
@@ -113,7 +165,9 @@ def health():
     # deploy from a browser: GET /health should show land_plots_enabled: true.
     return jsonify({"ok": True, "land_plots_enabled": PARCELS_OK,
                     "parcels_file_set": bool(PARCELS_FILE),
-                    "parcels_file_exists": PARCELS_OK})
+                    "parcels_file_exists": PARCELS_OK,
+                    "land_type_classification": True,          # always on (free OSM)
+                    "corporate_ownership_tier": _CCOD is not None})
 
 
 @app.route("/analyze", methods=["GET", "POST"])
@@ -147,7 +201,8 @@ def analyze():
 
     try:
         result = analyze_query(query, radius_m=radius, shape_kind=shape, canopy_min=canopy,
-                               parcels_path=parcels_path)
+                               parcels_path=parcels_path, os_key=OS_API_KEY,
+                               ccod=_CCOD, reverse_geocode=_REVERSE_GEOCODE)
         return jsonify(result)
     except ValueError as e:            # couldn't geocode the query
         return jsonify({"error": str(e)}), 422

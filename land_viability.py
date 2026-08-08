@@ -258,12 +258,18 @@ def _clean(gdf, aoi_bng):
     return clipped
 
 
+CLASSIFY_PLOTS = True   # tag each land plot with a land_type + owner_class (via plot_classify); free OSM-based
+
+
 def analyze_area(lat, lon, radius_m=DEFAULT_RADIUS_M, shape_kind=AOI_SHAPE, out_dir=None,
-                 canopy_min=CANOPY_MIN_HEIGHT_M, parcels_path=None):
+                 canopy_min=CANOPY_MIN_HEIGHT_M, parcels_path=None,
+                 classify=None, ccod=None, reverse_geocode=None):
     """Classify land in the AOI into buildings / vegetation / candidate. Returns a dict of EPSG:4326
     GeoDataFrames + area stats, and (if out_dir given) writes buildings/vegetation/candidate GeoJSON.
     If parcels_path is given (a council INSPIRE Index Polygons file), also returns a 'land_plots' layer
-    outlining every registered land parcel in the AOI -- the plot outlines for the app's area search."""
+    outlining every registered land parcel in the AOI -- the plot outlines for the app's area search.
+    Each land plot is additionally tagged with land_type + owner_class (see plot_classify) unless
+    classify is False; pass ccod/reverse_geocode to enable the Corporate-ownership tier."""
     print(f"Analysing {radius_m} m {shape_kind} around ({lat}, {lon}) ...")
     aoi = build_aoi_bng(lat, lon, radius_m, shape_kind)
     aoi_area = aoi.area
@@ -313,6 +319,13 @@ def analyze_area(lat, lon, radius_m=DEFAULT_RADIUS_M, shape_kind=AOI_SHAPE, out_
         try:
             import plot_outline as po
             plots = po.parcels_in_area(aoi, parcels_path, aoi_crs=BNG)
+            do_classify = CLASSIFY_PLOTS if classify is None else classify
+            if do_classify and not plots.empty:
+                try:
+                    import plot_classify as pc
+                    plots = pc.classify_plots(plots, aoi, aoi_crs=BNG, ccod=ccod, reverse_geocode=reverse_geocode)
+                except Exception as cex:
+                    print(f"  plot classification skipped ({cex}).")
             out["land_plots"] = plots.to_crs(WGS84) if not plots.empty else gpd.GeoDataFrame(geometry=[], crs=WGS84)
             stats["land_plots_count"] = int(len(plots))
             stats["land_plots_source"] = "HM Land Registry INSPIRE Index Polygons (registered freehold parcels)"
@@ -423,24 +436,39 @@ def resolve_location(query, os_key=None, w3w_key=None):
 
 
 def analyze_query(query, radius_m=DEFAULT_RADIUS_M, shape_kind=AOI_SHAPE, canopy_min=CANOPY_MIN_HEIGHT_M,
-                  os_key=None, w3w_key=None, out_dir=None, parcels_path=None):
+                  os_key=None, w3w_key=None, out_dir=None, parcels_path=None,
+                  ccod=None, reverse_geocode=None):
     """Platform entry point: resolve a search string (address/coords/what3words) then classify the
     area. Returns a JSON-serialisable dict: {query, resolved:{lat,lon}, radius_m, stats, geojson}
     where geojson is a single FeatureCollection with each feature tagged properties.class in
     {building, vegetation, candidate, aoi, land_plot} -- ready to style on your web map. Pass
-    parcels_path (a council INSPIRE file) to include the land_plot outlines in the area search."""
+    parcels_path (a council INSPIRE file) to include the land_plot outlines; each land_plot feature
+    also carries properties.land_type and properties.owner_class. Pass ccod/reverse_geocode to enable
+    the Corporate-ownership tier."""
     lat, lon = resolve_location(query, os_key, w3w_key)
     out = analyze_area(lat, lon, radius_m, shape_kind, out_dir=out_dir, canopy_min=canopy_min,
-                       parcels_path=parcels_path)
+                       parcels_path=parcels_path, ccod=ccod, reverse_geocode=reverse_geocode)
     feats = []
-    layers = [("building", "buildings"), ("vegetation", "vegetation"),
-              ("candidate", "candidate"), ("aoi", "aoi")]
-    if "land_plots" in out:
-        layers.append(("land_plot", "land_plots"))
-    for cls, key in layers:
+    for cls, key in (("building", "buildings"), ("vegetation", "vegetation"),
+                     ("candidate", "candidate"), ("aoi", "aoi")):
         for geom in out[key].geometry:
             if geom is not None and not geom.is_empty:
                 feats.append({"type": "Feature", "properties": {"class": cls}, "geometry": mapping(geom)})
+    # land_plot features carry their per-plot classification (land_type / owner_class / source).
+    if "land_plots" in out and not out["land_plots"].empty:
+        lp = out["land_plots"]
+        for _i, row in lp.iterrows():
+            geom = row.geometry
+            if geom is None or geom.is_empty:
+                continue
+            props = {"class": "land_plot",
+                     "land_type": row.get("land_type", "Unknown") if hasattr(row, "get") else "Unknown",
+                     "owner_class": row.get("owner_class", "Other") if hasattr(row, "get") else "Other"}
+            if "class_source" in lp.columns:
+                props["class_source"] = row.get("class_source", "")
+            if "inspire_id" in lp.columns:
+                props["inspire_id"] = row.get("inspire_id", "")
+            feats.append({"type": "Feature", "properties": props, "geometry": mapping(geom)})
     return {"query": query, "resolved": {"lat": lat, "lon": lon}, "radius_m": radius_m,
             "stats": out["stats"], "geojson": {"type": "FeatureCollection", "features": feats}}
 
