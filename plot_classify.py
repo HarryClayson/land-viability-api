@@ -123,27 +123,59 @@ def fetch_osm_landuse(aoi_bng, aoi_crs=BNG, timeout=60):
     minx, miny, maxx, maxy = aoi_wgs.bounds           # lon/lat
     s, w, n, e = miny, minx, maxy, maxx               # Overpass wants (south,west,north,east)
     bbox = f"{s},{w},{n},{e}"
+    # 'out geom;' returns tags AND geometry (the default 'body' verbosity includes tags). Also fetch
+    # relations (big woods/water are multipolygons), not just ways.
     q = (f"[out:json][timeout:{timeout}];("
          f'way["landuse"]({bbox});way["natural"]({bbox});way["water"]({bbox});'
          f'way["waterway"]({bbox});way["leisure"]({bbox});way["amenity"]({bbox});'
-         f'way["office"="government"]({bbox}););out tags geom;')
-    r = requests.post("https://overpass-api.de/api/interpreter", data={"data": q}, timeout=timeout + 15)
-    r.raise_for_status()
-    geoms, tag_dicts = [], []
-    for el in r.json().get("elements", []):
-        pts = el.get("geometry") or []
-        if len(pts) < 3:
-            continue
+         f'way["office"="government"]({bbox});'
+         f'relation["landuse"]({bbox});relation["natural"]({bbox});relation["leisure"]({bbox});'
+         f");out geom;")
+    # Try several public Overpass mirrors -- the main one is often busy / rate-limits, which was
+    # silently turning every plot 'Unknown'.
+    endpoints = ["https://overpass-api.de/api/interpreter",
+                 "https://overpass.kumi.systems/api/interpreter",
+                 "https://maps.mail.ru/osm/tools/overpass/api/interpreter"]
+    data = None
+    for url in endpoints:
         try:
-            poly = Polygon([(p["lon"], p["lat"]) for p in pts])
-            if not poly.is_valid:
-                poly = poly.buffer(0)
-            if poly.is_empty:
-                continue
+            r = requests.post(url, data={"data": q}, timeout=timeout + 15)
+            if r.status_code == 200:
+                data = r.json()
+                break
+            print(f"    OSM: {url} -> HTTP {r.status_code}")
+        except Exception as ex:
+            print(f"    OSM: {url} failed ({ex})")
+    if data is None:
+        raise RuntimeError("all Overpass endpoints failed/blocked")
+    elements = data.get("elements", [])
+    print(f"    OSM: {len(elements)} element(s) returned by Overpass")
+    def _poly(pts):
+        if len(pts) < 3:
+            return None
+        try:
+            p = Polygon([(q["lon"], q["lat"]) for q in pts])
+            if not p.is_valid:
+                p = p.buffer(0)
+            return None if p.is_empty else p
         except Exception:
+            return None
+
+    geoms, tag_dicts = [], []
+    for el in elements:
+        tags = el.get("tags", {})
+        if el.get("type") == "relation":                      # multipolygon: use its outer rings
+            for m in el.get("members", []):
+                if m.get("role") == "outer":
+                    p = _poly(m.get("geometry") or [])
+                    if p is not None:
+                        geoms.append(p)
+                        tag_dicts.append(tags)
             continue
-        geoms.append(poly)
-        tag_dicts.append(el.get("tags", {}))
+        p = _poly(el.get("geometry") or [])
+        if p is not None:
+            geoms.append(p)
+            tag_dicts.append(tags)
     if not geoms:
         return gpd.GeoDataFrame({"ltype": [], "owner_hint": []}, geometry=[], crs=BNG)
     gdf = gpd.GeoDataFrame(geometry=geoms, crs=WGS84).to_crs(BNG)
@@ -187,38 +219,31 @@ def classify_land_type(plot_geom, osm_gdf):
     return best, f"OSM {best} ({round(frac[best] * 100)}% of plot)"
 
 
-def classify_owner(plot_geom, osm_gdf, ccod=None, reverse_geocode=None):
-    """(owner_class, source) for one plot. Government from OSM public/institutional signal; Corporate/
-    Government from optional CCOD (address->postcode->proprietor category); else 'Other'."""
-    # 1) OSM public/institutional/military signal
-    if osm_gdf is not None and len(osm_gdf):
-        try:
-            cand = list(osm_gdf.sindex.query(plot_geom, predicate="intersects"))
-        except Exception:
-            cand = list(range(len(osm_gdf)))
-        for i in cand:
-            if osm_gdf.iloc[i]["owner_hint"] == "Government":
-                try:
-                    if plot_geom.intersects(osm_gdf.geometry.iloc[i]):
-                        return "Government", "OSM public/institutional use"
-                except Exception:
-                    pass
-    # 2) optional CCOD/OCOD corporate + public match by postcode
-    if ccod is not None and reverse_geocode is not None:
-        try:
-            postcode = reverse_geocode(plot_geom.centroid)
-            cls = ccod.classify_postcode(postcode) if postcode else None
-            if cls:
-                return cls, f"HMLR CCOD/OCOD match ({postcode})"
-        except Exception:
-            pass
-    return "Other", "no corporate/public match"
+def _gov_from_osm(plot_geom, osm_gdf):
+    """True if any overlapping OSM feature marks this plot as public/institutional/military."""
+    if osm_gdf is None or len(osm_gdf) == 0:
+        return False
+    try:
+        cand = list(osm_gdf.sindex.query(plot_geom, predicate="intersects"))
+    except Exception:
+        cand = list(range(len(osm_gdf)))
+    for i in cand:
+        if osm_gdf.iloc[i]["owner_hint"] == "Government":
+            try:
+                if plot_geom.intersects(osm_gdf.geometry.iloc[i]):
+                    return True
+            except Exception:
+                pass
+    return False
 
 
-def classify_plots(plots_gdf, aoi_bng, aoi_crs=BNG, ccod=None, reverse_geocode=None):
+def classify_plots(plots_gdf, aoi_bng, aoi_crs=BNG, ccod=None, reverse_geocode_bulk=None):
     """Add land_type / owner_class / class_source columns to a plots GeoDataFrame (in the plots' CRS).
-    Fetches OSM once for the whole AOI, then classifies each plot. Never raises: on any failure the
-    plots come back with land_type='Unknown' and owner_class='Other'."""
+    Fetches OSM ONCE for the whole AOI, then classifies each plot. Ownership is done in BULK: plots that
+    aren't already Government-by-OSM are reverse-geocoded to a postcode in a SINGLE batched call (per
+    ~100 plots) rather than one HTTP request each -- this is what keeps a big search from timing out.
+    Never raises: on any failure plots come back land_type='Unknown', owner_class='Other'."""
+    from pyproj import Transformer
     out = plots_gdf.copy()
     osm = None
     try:
@@ -226,13 +251,39 @@ def classify_plots(plots_gdf, aoi_bng, aoi_crs=BNG, ccod=None, reverse_geocode=N
         print(f"  classify: {len(osm)} OSM land-use feature(s) in the AOI")
     except Exception as e:
         print(f"  classify: OSM land-use unavailable ({e}); land types will be 'Unknown'.")
+
+    to_wgs = Transformer.from_crs(BNG, WGS84, always_xy=True)
     types, owners, sources = [], [], []
-    for geom in out.geometry:
+    pending_idx, pending_lonlat = [], []          # plots needing a CCOD postcode lookup
+    for i, geom in enumerate(out.geometry):
         lt, lts = classify_land_type(geom, osm)
-        oc, ocs = classify_owner(geom, osm, ccod, reverse_geocode)
         types.append(lt)
-        owners.append(oc)
-        sources.append(f"type: {lts}; owner: {ocs}")
+        if _gov_from_osm(geom, osm):
+            owners.append("Government")
+            sources.append(f"type: {lts}; owner: OSM public/institutional use")
+        else:
+            owners.append("Other")               # provisional; may be upgraded by the CCOD batch below
+            sources.append(f"type: {lts}; owner: no corporate/public match")
+            if ccod is not None and reverse_geocode_bulk is not None:
+                c = geom.centroid
+                lon, lat = to_wgs.transform(c.x, c.y)
+                pending_idx.append(i)
+                pending_lonlat.append((lon, lat))
+
+    # ONE batched reverse-geocode for every pending plot, then CCOD lookup.
+    if pending_idx:
+        try:
+            postcodes = reverse_geocode_bulk(pending_lonlat)
+        except Exception as e:
+            print(f"  classify: bulk reverse-geocode failed ({e}); ownership stays Government/Other.")
+            postcodes = [None] * len(pending_idx)
+        for k, i in enumerate(pending_idx):
+            pc = postcodes[k] if k < len(postcodes) else None
+            cls = ccod.classify_postcode(pc) if pc else None
+            if cls:
+                owners[i] = cls
+                sources[i] = sources[i].rsplit("owner:", 1)[0] + f"owner: CCOD {pc} -> {cls}"
+
     out["land_type"] = types
     out["owner_class"] = owners
     out["class_source"] = sources
@@ -299,45 +350,27 @@ class CCOD:
         return self._by_postcode.get(self._norm_pc(postcode))
 
 
-def postcodesio_reverse_geocode():
-    """Return a function point(BNG Point)->postcode using the FREE postcodes.io reverse lookup (no key,
-    no account). Best-effort; never raises. This is the default reverse-geocoder for the Corporate tier."""
-    import requests
-    from pyproj import Transformer
-    to_wgs = Transformer.from_crs(BNG, WGS84, always_xy=True)
-
-    def _rev(point_bng):
-        try:
-            lon, lat = to_wgs.transform(point_bng.x, point_bng.y)
-            r = requests.get("https://api.postcodes.io/postcodes",
-                             params={"lon": lon, "lat": lat, "limit": 1, "radius": 1000}, timeout=15)
-            r.raise_for_status()
-            res = (r.json() or {}).get("result") or []
-            if res:
-                return res[0].get("postcode")
-        except Exception:
-            return None
-        return None
-    return _rev
-
-
-def os_places_reverse_geocode(os_api_key):
-    """Return a function point(BNG shapely Point)->postcode using the OS Places 'nearest' API (needs an
-    OS Data Hub key). Returns None-yielding function if no key. Best-effort; never raises."""
-    if not os_api_key:
-        return None
+def postcodesio_bulk_reverse_geocode():
+    """Return a function that takes a LIST of (lon, lat) WGS84 points and returns a same-length list of
+    postcodes (or None), using the FREE postcodes.io BULK reverse-geocode endpoint -- up to 100 points
+    per HTTP request (no key, no account). This is what makes the Corporate tier fast: a 200-plot
+    search does ~2 requests, not 200. Best-effort; never raises."""
     import requests
 
-    def _rev(point_bng):
-        try:
-            r = requests.get("https://api.os.uk/search/places/v1/nearest",
-                             params={"point": f"{point_bng.x},{point_bng.y}", "key": os_api_key,
-                                     "srs": "BNG", "output_srs": "BNG"}, timeout=20)
-            r.raise_for_status()
-            results = r.json().get("results") or []
-            if results:
-                return (results[0].get("DPA") or results[0].get("LPI") or {}).get("POSTCODE")
-        except Exception:
-            return None
-        return None
-    return _rev
+    def _bulk(lonlats):
+        out = [None] * len(lonlats)
+        for start in range(0, len(lonlats), 100):
+            chunk = lonlats[start:start + 100]
+            body = {"geolocations": [{"longitude": lo, "latitude": la, "limit": 1, "radius": 1000}
+                                     for lo, la in chunk]}
+            try:
+                r = requests.post("https://api.postcodes.io/postcodes", json=body, timeout=30)
+                r.raise_for_status()
+                for k, item in enumerate(r.json().get("result") or []):
+                    res = (item or {}).get("result") or []
+                    if res:
+                        out[start + k] = res[0].get("postcode")
+            except Exception:
+                pass          # leave this chunk as None; ownership just stays Other for those
+        return out
+    return _bulk
