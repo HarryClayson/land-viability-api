@@ -136,18 +136,24 @@ def fetch_osm_landuse(aoi_bng, aoi_crs=BNG, timeout=60):
     endpoints = ["https://overpass-api.de/api/interpreter",
                  "https://overpass.kumi.systems/api/interpreter",
                  "https://maps.mail.ru/osm/tools/overpass/api/interpreter"]
+    import time
     data = None
-    for url in endpoints:
-        try:
-            r = requests.post(url, data={"data": q}, timeout=timeout + 15)
-            if r.status_code == 200:
-                data = r.json()
-                break
-            print(f"    OSM: {url} -> HTTP {r.status_code}")
-        except Exception as ex:
-            print(f"    OSM: {url} failed ({ex})")
+    for attempt in range(2):                              # two passes across the mirrors, with a backoff
+        for url in endpoints:
+            try:
+                r = requests.post(url, data={"data": q}, timeout=timeout + 15)
+                if r.status_code == 200:
+                    data = r.json()
+                    break
+                print(f"    OSM: {url} -> HTTP {r.status_code}")   # 429 = rate-limited; try next mirror
+            except Exception as ex:
+                print(f"    OSM: {url} failed ({ex})")
+        if data is not None:
+            break
+        if attempt == 0:
+            time.sleep(3)                                 # brief backoff, then retry the mirrors once
     if data is None:
-        raise RuntimeError("all Overpass endpoints failed/blocked")
+        raise RuntimeError("all Overpass endpoints failed/blocked (likely rate-limited)")
     elements = data.get("elements", [])
     print(f"    OSM: {len(elements)} element(s) returned by Overpass")
     def _poly(pts):
